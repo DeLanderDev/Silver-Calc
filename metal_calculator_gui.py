@@ -833,6 +833,16 @@ class MetalCalculatorApp:
         # Save prediction button
         self.pred_save_btn = ttk.Button(select_grid, text="💾 Save Prediction", command=self.save_current_prediction, state='disabled')
         self.pred_save_btn.grid(row=0, column=5, padx=(5, 0), pady=5)
+
+        # Backtest export button
+        backtest_row = ttk.Frame(select_frame)
+        backtest_row.pack(fill='x', pady=(5, 0))
+        self.pred_backtest_btn = ttk.Button(
+            backtest_row,
+            text="🧪 Export 365d Backtest CSV",
+            command=self.backtest_predictions_thread
+        )
+        self.pred_backtest_btn.pack(anchor='w')
         
         self.pred_status_var = tk.StringVar(value="Select metals and click 'Fetch Prediction Data'")
         ttk.Label(select_frame, textvariable=self.pred_status_var, foreground="gray", font=('Segoe UI', 9)).pack(anchor='w', pady=(5, 0))
@@ -969,6 +979,7 @@ class MetalCalculatorApp:
         history_toolbar.pack(fill='x', pady=(0, 5))
         
         ttk.Button(history_toolbar, text="📈 Grade Predictions", command=self.grade_predictions_thread).pack(side='left')
+        ttk.Button(history_toolbar, text="🧪 Backtest CSV", command=self.backtest_predictions_thread).pack(side='left', padx=(5, 0))
         ttk.Button(history_toolbar, text="🗑️ Delete Selected", command=self.delete_selected_prediction).pack(side='left', padx=(5, 0))
         ttk.Button(history_toolbar, text="🗑️ Clear All", command=self.clear_prediction_history).pack(side='left', padx=(5, 0))
         
@@ -1535,6 +1546,33 @@ class MetalCalculatorApp:
         
         thread = threading.Thread(target=self.fetch_prediction_data, daemon=True)
         thread.start()
+
+    def backtest_predictions_thread(self):
+        """Start 365-day backtest export in a separate thread"""
+        if yf is None:
+            messagebox.showerror("Missing Library", "yfinance is required for prediction backtests.\n\nInstall with: pip install yfinance")
+            return
+
+        primary_metal = self.pred_primary_var.get()
+        secondary_name = self.pred_secondary_var.get()
+        if primary_metal == secondary_name:
+            messagebox.showwarning("Same Selection", "Please select two different items for backtest comparison.")
+            return
+
+        default_name = f"backtest_{primary_metal}_vs_{secondary_name}_{datetime.now().strftime('%Y%m%d')}.csv"
+        filepath = filedialog.asksaveasfilename(
+            title="Save Backtest CSV",
+            defaultextension=".csv",
+            initialfile=default_name,
+            filetypes=[("CSV Files", "*.csv")]
+        )
+        if not filepath:
+            return
+
+        self.pred_backtest_btn.config(state='disabled')
+        self.pred_status_var.set("Running 365-day backtest... please wait")
+        thread = threading.Thread(target=lambda: self.backtest_predictions(filepath), daemon=True)
+        thread.start()
     
     def fetch_prediction_data(self):
         """Fetch price data for both metals/indices for prediction plus DXY"""
@@ -1656,6 +1694,206 @@ class MetalCalculatorApp:
                 
                 messagebox.showerror("Fetch Error", error_msg)
             self.root.after(0, show_error)
+
+    def backtest_predictions(self, filepath):
+        """Run a 365-day backtest for the selected pair and export CSV"""
+        primary_metal = self.pred_primary_var.get()
+        secondary_name = self.pred_secondary_var.get()
+        secondary_config = PREDICTION_SECONDARIES.get(secondary_name)
+        if not secondary_config:
+            self.root.after(0, lambda: messagebox.showerror("Backtest Error", "Invalid secondary selection."))
+            self.root.after(0, lambda: self.pred_backtest_btn.config(state='normal'))
+            return
+
+        original_prediction_data = self.prediction_data
+
+        def finish_with_error(msg):
+            self.root.after(0, lambda: messagebox.showerror("Backtest Error", msg))
+            self.root.after(0, lambda: self.pred_status_var.set("Backtest failed"))
+            self.root.after(0, lambda: self.pred_backtest_btn.config(state='normal'))
+
+        try:
+            self.root.after(0, lambda: self.pred_status_var.set("Fetching backtest data..."))
+
+            primary_config = METALS[primary_metal]
+            primary_hist, primary_err = self.fetch_yf_history_with_retry(
+                primary_config['yf_ticker'], period="2y", timeout=30, max_retries=2
+            )
+            if primary_err or primary_hist is None or primary_hist.empty:
+                finish_with_error(f"Failed to fetch {primary_metal} history: {primary_err or 'No data returned'}")
+                return
+
+            secondary_hist, secondary_err = self.fetch_yf_history_with_retry(
+                secondary_config['yf_ticker'], period="2y", timeout=30, max_retries=2
+            )
+            if secondary_err or secondary_hist is None or secondary_hist.empty:
+                finish_with_error(f"Failed to fetch {secondary_name} history: {secondary_err or 'No data returned'}")
+                return
+
+            dxy_hist, dxy_err = self.fetch_yf_history_with_retry(
+                DXY_TICKER, period="2y", timeout=30, max_retries=2
+            )
+            if dxy_err or dxy_hist is None or dxy_hist.empty:
+                finish_with_error(f"Failed to fetch DXY history: {dxy_err or 'No data returned'}")
+                return
+
+            sp500_hist = None
+            if secondary_name != 'S&P 500':
+                sp500_hist, sp_err = self.fetch_yf_history_with_retry(
+                    SP500_TICKER_REGIME, period="2y", timeout=30, max_retries=2
+                )
+                if sp_err or sp500_hist is None or sp500_hist.empty:
+                    finish_with_error(f"Failed to fetch S&P 500 history: {sp_err or 'No data returned'}")
+                    return
+
+            primary_df = primary_hist[['Close', 'High', 'Low']].rename(
+                columns={'Close': 'Primary_Close', 'High': 'Primary_High', 'Low': 'Primary_Low'}
+            )
+            primary_df[['Primary_Close', 'Primary_High', 'Primary_Low']] = (
+                primary_df[['Primary_Close', 'Primary_High', 'Primary_Low']] / TROY_OUNCE_TO_GRAMS
+            )
+
+            secondary_df = secondary_hist[['Close', 'High', 'Low']].rename(
+                columns={'Close': 'Secondary_Close', 'High': 'Secondary_High', 'Low': 'Secondary_Low'}
+            )
+            if secondary_config['type'] == 'metal':
+                secondary_df[['Secondary_Close', 'Secondary_High', 'Secondary_Low']] = (
+                    secondary_df[['Secondary_Close', 'Secondary_High', 'Secondary_Low']] / TROY_OUNCE_TO_GRAMS
+                )
+
+            dxy_df = dxy_hist[['Close']].rename(columns={'Close': 'DXY_Close'})
+
+            combined = primary_df.join(secondary_df, how='inner')
+            combined = combined.join(dxy_df, how='inner')
+
+            if secondary_name == 'S&P 500':
+                sp500_df = secondary_df[['Secondary_Close']].rename(columns={'Secondary_Close': 'SP500_Close'})
+                combined = combined.join(sp500_df, how='inner')
+            else:
+                sp500_df = sp500_hist[['Close']].rename(columns={'Close': 'SP500_Close'})
+                combined = combined.join(sp500_df, how='inner')
+
+            if combined.empty or len(combined) < 80:
+                finish_with_error("Insufficient overlapping history for backtest (need at least ~80 trading days).")
+                return
+
+            primary_closes = combined['Primary_Close'].tolist()
+            primary_highs = combined['Primary_High'].tolist()
+            primary_lows = combined['Primary_Low'].tolist()
+            secondary_closes = combined['Secondary_Close'].tolist()
+            secondary_highs = combined['Secondary_High'].tolist()
+            secondary_lows = combined['Secondary_Low'].tolist()
+            dxy_closes = combined['DXY_Close'].tolist()
+            sp500_closes = combined['SP500_Close'].tolist()
+
+            total_len = len(combined)
+            start_index = max(60, REGIME_MA_DAYS, 28, 15)
+            end_index = total_len - 7
+            if end_index <= start_index:
+                finish_with_error("Not enough history to compute 7-day backtest results.")
+                return
+
+            start_index = max(start_index, end_index - 365)
+            self.root.after(0, lambda: self.pred_status_var.set("Calculating backtest predictions..."))
+
+            rows = []
+            for i in range(start_index, end_index):
+                self.prediction_data = {
+                    primary_metal: {
+                        'closes': primary_closes[:i + 1],
+                        'highs': primary_highs[:i + 1],
+                        'lows': primary_lows[:i + 1],
+                    },
+                    secondary_name: {
+                        'closes': secondary_closes[:i + 1],
+                        'highs': secondary_highs[:i + 1],
+                        'lows': secondary_lows[:i + 1],
+                    },
+                    'DXY': {
+                        'closes': dxy_closes[:i + 1],
+                    },
+                    'SP500_REGIME': {
+                        'closes': sp500_closes[:i + 1],
+                    },
+                }
+
+                prediction = self.calculate_prediction(primary_metal, secondary_name)
+                if not prediction:
+                    continue
+
+                current_price = primary_closes[i]
+                predicted_price = prediction['predicted_price']
+                predicted_change_pct = ((predicted_price - current_price) / current_price) * 100 if current_price > 0 else 0
+
+                confidence, _signals = self.calculate_confidence(primary_metal, secondary_name, prediction)
+
+                actual_price = primary_closes[i + 7]
+                actual_change_pct = ((actual_price - current_price) / current_price) * 100 if current_price > 0 else 0
+
+                direction_correct = (actual_change_pct >= 0 and predicted_change_pct >= 0) or \
+                                   (actual_change_pct < 0 and predicted_change_pct < 0)
+
+                error_pct = ((actual_price - predicted_price) / predicted_price) * 100 if predicted_price > 0 else 0
+                grade = self.get_prediction_grade({'graded': True, 'error_pct': error_pct})
+
+                atr = self.calculate_atr(primary_highs[:i + 1], primary_lows[:i + 1], primary_closes[:i + 1])
+                range_low = current_price - (atr * SQRT_7) if atr else None
+                range_high = current_price + (atr * SQRT_7) if atr else None
+                in_range = None
+                if range_low is not None and range_high is not None:
+                    in_range = range_low <= actual_price <= range_high
+
+                date_label = combined.index[i].date().isoformat() if hasattr(combined.index[i], 'date') else str(combined.index[i])
+
+                rows.append({
+                    'date': date_label,
+                    'primary_metal': primary_metal,
+                    'secondary_metal': secondary_name,
+                    'current_price': round(current_price, 6),
+                    'predicted_price': round(predicted_price, 6),
+                    'predicted_change_pct': round(predicted_change_pct, 4),
+                    'confidence_pct': round(confidence, 2),
+                    'actual_price_7d': round(actual_price, 6),
+                    'actual_change_pct_7d': round(actual_change_pct, 4),
+                    'error_pct': round(error_pct, 4),
+                    'grade': grade,
+                    'direction_correct': direction_correct,
+                    'range_low': round(range_low, 6) if range_low is not None else None,
+                    'range_high': round(range_high, 6) if range_high is not None else None,
+                    'in_range': in_range,
+                    'beta': round(prediction.get('beta', 0), 4),
+                    'correlation': round(prediction.get('correlation', 0), 4),
+                    'rsi': round(self.calculate_rsi(primary_closes[:i + 1]) or 0, 2),
+                    'atr': round(atr or 0, 6),
+                    'volatility_pct': round(prediction.get('volatility_pct') or 0, 4),
+                    'momentum_7d': round(self.calculate_momentum(primary_closes[:i + 1], period=7) or 0, 4),
+                    'momentum_14d': round(self.calculate_momentum(primary_closes[:i + 1], period=14) or 0, 4),
+                    'ratio_deviation_pct': round(prediction.get('ratio_deviation', 0), 4),
+                    'regime': prediction.get('regime'),
+                    'regime_change': prediction.get('regime_change'),
+                })
+
+            if not rows:
+                finish_with_error("Backtest produced no results (insufficient data).")
+                return
+
+            fieldnames = list(rows[0].keys())
+            with open(filepath, 'w', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+
+            def finish_success():
+                self.pred_status_var.set(f"Backtest complete: {len(rows)} rows exported")
+                messagebox.showinfo("Backtest Exported", f"Exported {len(rows)} rows to:\n{filepath}")
+                self.pred_backtest_btn.config(state='normal')
+
+            self.root.after(0, finish_success)
+
+        except Exception as e:
+            finish_with_error(str(e))
+        finally:
+            self.prediction_data = original_prediction_data
     
     def calculate_rsi(self, closes, period=14):
         """Calculate Relative Strength Index using Wilder's smoothed EMA"""
