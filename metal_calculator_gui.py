@@ -993,7 +993,19 @@ class MetalCalculatorApp:
         ttk.Label(ind_grid, text="Correlation:", font=('Segoe UI', 9, 'bold')).grid(row=4, column=2, sticky='e', padx=(30, 10), pady=5)
         self.pred_correlation_var = tk.StringVar(value="--")
         ttk.Label(ind_grid, textvariable=self.pred_correlation_var, font=('Segoe UI', 10)).grid(row=4, column=3, sticky='w', pady=5)
-        
+
+        # Market condition note
+        note_frame = ttk.Frame(indicators_frame)
+        note_frame.pack(fill='x', pady=(10, 0))
+        ttk.Separator(note_frame, orient='horizontal').pack(fill='x', pady=(0, 5))
+        note_text = (
+            "Market Condition Notes:\n"
+            "  \u2022 Silver/Platinum pair is best suited for bull or bear markets\n"
+            "  \u2022 Silver/S&P 500 pair is best suited for sideways markets"
+        )
+        ttk.Label(note_frame, text=note_text, font=('Segoe UI', 8, 'italic'),
+                  foreground='gray', justify='left').pack(anchor='w')
+
         # Current price reference (range band is shown at top of 7-Day Outlook)
         range_frame = ttk.LabelFrame(parent, text=" Reference ", padding="10")
         range_frame.pack(fill='x', pady=(0, 10))
