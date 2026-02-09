@@ -91,20 +91,61 @@ DXY_TICKER = 'DX-Y.NYB'
 # Square root of 7 for weekly volatility scaling
 SQRT_7 = 2.6457513110645907  # math.sqrt(7)
 
-# Prediction v3: Regime and clamp constants (advisor-backed)
+# Prediction v4: Regime and clamp constants
 SP500_TICKER_REGIME = '^GSPC'
-REGIME_MA_DAYS = 50
+VIX_TICKER = '^VIX'
+REGIME_MA_DAYS = 20
 CORRELATION_FAST_DAYS = 10
 CORRELATION_REGIME_DIVERGENCE = 0.3   # fast vs slow correlation diff = regime change
+
+# Clamp levels
 CLAMP_NORMAL = 0.10      # ±10% normal volatility
 CLAMP_ELEVATED = 0.15    # ±15% elevated vol
 CLAMP_CRISIS = 0.25      # ±25% crisis / regime change
+CLAMP_RECOVERY = 0.15    # ±15% recovery
+CLAMP_CRASH_SIGMA = 3.0  # dynamic σ-based (3σ max) for crash
+
 VOLATILITY_ELEVATED_PCT = 4.0   # ATR/price % threshold for elevated clamp
 VOLATILITY_CRISIS_PCT = 8.0     # ATR/price % for crisis clamp
-BEAR_SAFETY_FACTOR = 0.8        # scale ExpectedMove in bear regime (advisor: fix 23% down-market accuracy)
-REGIME_BETA_SHRINK = 0.7        # shrink beta when regime change or bear (reduce amplification)
+
+# Beta adjustments
+BEAR_BETA_SHRINK = 0.7          # bear beta 0.7x
+REGIME_BETA_SHRINK = 0.7        # shrink beta when regime change (reduce amplification)
+
+# Crash detection thresholds (3/5 triggers needed)
+CRASH_VIX_THRESHOLD = 25.0
+CRASH_GSR_THRESHOLD = 85.0
+CRASH_ATR_PCT_THRESHOLD = 5.0
+CRASH_CONSECUTIVE_DAYS = 3       # 3+ days with >2% moves
+CRASH_CONSECUTIVE_MOVE = 0.02    # 2% daily move threshold
+CRASH_DXY_RISE = 0.01           # DXY +1% (5-day)
+CRASH_METAL_DROP = -0.02        # Metal -2% (5-day)
+CRASH_TRIGGERS_NEEDED = 3       # 3 out of 5 triggers
+CRASH_REVERSION_FACTOR = 0.30   # 30% towards 50d MA
+CRASH_REVERSION_MA = 50         # revert towards 50d MA
+
+# Recovery constants
+RECOVERY_BUFFER_DAYS = 10       # 10 day buffer after crash
+RECOVERY_REVERSION_FACTOR = 0.20  # 20% towards 20d MA
+RECOVERY_REVERSION_MA = 20      # revert towards 20d MA
+
+# Ratio pressure
+RATIO_BASE_MULTIPLIER_FACTOR = 0.15  # |ρ| × 0.15
+RATIO_SIDEWAYS_BOOST = 2.0
 BEARISH_MOMENTUM_CUT_RATIO = 0.0  # zero ratio pressure when primary 14d momentum negative
+
 CONFIDENCE_CAP_REGIME_CHANGE = 50   # cap confidence % when regime change detected
+
+# Confidence weights (8-factor, total = 100%)
+CONF_W_CORRELATION = 40        # Correlation (60d) 40%
+CONF_W_DXY = 7                 # DXY health 7% (4% for copper)
+CONF_W_DXY_COPPER = 4          # Copper DXY weight
+CONF_W_REGIME_FIT = 10         # Regime fit 10%
+CONF_W_RSI = 10                # RSI range 10%
+CONF_W_VOLATILITY = 5          # Volatility 5%
+CONF_W_RATIO = 10              # Ratio stability 10%
+CONF_W_RSI_DIVERGENCE = 8      # RSI Divergence 8%
+CONF_W_CORR_AGREEMENT = 10     # Correlation Agreement 10%
 
 # Conversion factors
 TROY_OUNCE_TO_GRAMS = 31.1035
@@ -1624,7 +1665,7 @@ class MetalCalculatorApp:
                 'closes': [float(p) for p in dxy_hist['Close']],
             }
             
-            # ===== S&P 500 for regime detection (50d MA) - reuse if secondary is S&P 500 =====
+            # ===== S&P 500 for regime detection (20d MA) - reuse if secondary is S&P 500 =====
             if secondary_name == 'S&P 500':
                 self.prediction_data['SP500_REGIME'] = {'closes': self.prediction_data['S&P 500']['closes']}
             else:
@@ -1638,6 +1679,44 @@ class MetalCalculatorApp:
                     }
                 else:
                     self.prediction_data['SP500_REGIME'] = None  # regime unavailable
+
+            # ===== Fetch VIX for crash detection =====
+            self.root.after(0, lambda: self.pred_status_var.set("Fetching VIX (crash detection)..."))
+            vix_hist, vix_err = self.fetch_yf_history_with_retry(
+                VIX_TICKER, period="3mo", timeout=30, max_retries=2
+            )
+            if not vix_err and vix_hist is not None:
+                self.prediction_data['VIX'] = {
+                    'closes': [float(p) for p in vix_hist['Close']],
+                }
+            else:
+                self.prediction_data['VIX'] = None
+
+            # ===== Fetch Gold for GSR calculation (if not already primary/secondary) =====
+            if primary_metal != 'Gold' and secondary_name != 'Gold':
+                self.root.after(0, lambda: self.pred_status_var.set("Fetching Gold (GSR)..."))
+                gold_hist, gold_err = self.fetch_yf_history_with_retry(
+                    METALS['Gold']['yf_ticker'], period="3mo", timeout=30, max_retries=2
+                )
+                if not gold_err and gold_hist is not None:
+                    self.prediction_data['Gold_GSR'] = {
+                        'closes': [float(p) / TROY_OUNCE_TO_GRAMS for p in gold_hist['Close']],
+                    }
+                else:
+                    self.prediction_data['Gold_GSR'] = None
+
+            # ===== Fetch Silver for GSR calculation (if not already primary/secondary) =====
+            if primary_metal != 'Silver' and secondary_name != 'Silver':
+                self.root.after(0, lambda: self.pred_status_var.set("Fetching Silver (GSR)..."))
+                silver_hist, silver_err = self.fetch_yf_history_with_retry(
+                    METALS['Silver']['yf_ticker'], period="3mo", timeout=30, max_retries=2
+                )
+                if not silver_err and silver_hist is not None:
+                    self.prediction_data['Silver_GSR'] = {
+                        'closes': [float(p) / TROY_OUNCE_TO_GRAMS for p in silver_hist['Close']],
+                    }
+                else:
+                    self.prediction_data['Silver_GSR'] = None
             
             # ===== Calculate all indicators and prediction =====
             self.root.after(0, lambda: self.pred_status_var.set("Calculating indicators..."))
@@ -1734,30 +1813,168 @@ class MetalCalculatorApp:
         momentum_pct = (math.exp(log_return) - 1) * 100
         return momentum_pct
     
+    def _detect_crash_triggers(self, primary_metal):
+        """
+        Crash Detection System with 5 triggers. Returns (trigger_count, trigger_details).
+        Triggers:
+          1. VIX > 25
+          2. Gold/Silver Ratio (GSR) > 85
+          3. ATR% > 5%
+          4. 3+ consecutive days with >2% daily moves
+          5. DXY +1% AND metal -2% (5-day divergence)
+        """
+        triggers = []
+        trigger_count = 0
+
+        # Get primary data
+        primary = self.prediction_data.get(primary_metal, {})
+        primary_closes = primary.get('closes', [])
+
+        # Trigger 1: VIX > 25
+        vix_data = self.prediction_data.get('VIX')
+        if vix_data and vix_data.get('closes'):
+            vix_cur = vix_data['closes'][-1]
+            if vix_cur > CRASH_VIX_THRESHOLD:
+                trigger_count += 1
+                triggers.append(f"VIX={vix_cur:.1f} > {CRASH_VIX_THRESHOLD}")
+            else:
+                triggers.append(f"VIX={vix_cur:.1f} OK")
+        else:
+            triggers.append("VIX: no data")
+
+        # Trigger 2: GSR > 85
+        gold_closes = None
+        silver_closes = None
+        # Try to get gold/silver data from various sources
+        if 'Gold' in self.prediction_data:
+            gold_closes = self.prediction_data['Gold'].get('closes', [])
+        elif 'Gold_GSR' in self.prediction_data and self.prediction_data['Gold_GSR']:
+            gold_closes = self.prediction_data['Gold_GSR'].get('closes', [])
+        if 'Silver' in self.prediction_data:
+            silver_closes = self.prediction_data['Silver'].get('closes', [])
+        elif 'Silver_GSR' in self.prediction_data and self.prediction_data['Silver_GSR']:
+            silver_closes = self.prediction_data['Silver_GSR'].get('closes', [])
+
+        if gold_closes and silver_closes and silver_closes[-1] > 0:
+            gsr = gold_closes[-1] / silver_closes[-1]
+            if gsr > CRASH_GSR_THRESHOLD:
+                trigger_count += 1
+                triggers.append(f"GSR={gsr:.1f} > {CRASH_GSR_THRESHOLD}")
+            else:
+                triggers.append(f"GSR={gsr:.1f} OK")
+        else:
+            triggers.append("GSR: no data")
+
+        # Trigger 3: ATR% > 5%
+        primary_highs = primary.get('highs', [])
+        primary_lows = primary.get('lows', [])
+        atr_val = self.calculate_atr(primary_highs, primary_lows, primary_closes)
+        if atr_val and len(primary_closes) > 0 and primary_closes[-1] > 0:
+            atr_pct = (atr_val / primary_closes[-1]) * 100
+            if atr_pct > CRASH_ATR_PCT_THRESHOLD:
+                trigger_count += 1
+                triggers.append(f"ATR%={atr_pct:.1f}% > {CRASH_ATR_PCT_THRESHOLD}%")
+            else:
+                triggers.append(f"ATR%={atr_pct:.1f}% OK")
+        else:
+            triggers.append("ATR%: no data")
+
+        # Trigger 4: 3+ consecutive days with >2% daily moves
+        if len(primary_closes) >= CRASH_CONSECUTIVE_DAYS + 1:
+            consecutive = 0
+            max_consecutive = 0
+            for i in range(-CRASH_CONSECUTIVE_DAYS - 5, 0):
+                if i - 1 >= -len(primary_closes) and primary_closes[i - 1] > 0:
+                    daily_move = abs(primary_closes[i] / primary_closes[i - 1] - 1)
+                    if daily_move > CRASH_CONSECUTIVE_MOVE:
+                        consecutive += 1
+                        max_consecutive = max(max_consecutive, consecutive)
+                    else:
+                        consecutive = 0
+            if max_consecutive >= CRASH_CONSECUTIVE_DAYS:
+                trigger_count += 1
+                triggers.append(f"Consecutive={max_consecutive}d > {CRASH_CONSECUTIVE_DAYS}d")
+            else:
+                triggers.append(f"Consecutive={max_consecutive}d OK")
+        else:
+            triggers.append("Consecutive: no data")
+
+        # Trigger 5: DXY +1% AND metal -2% (5-day divergence)
+        dxy_data = self.prediction_data.get('DXY')
+        if dxy_data and dxy_data.get('closes') and len(dxy_data['closes']) >= 6 and len(primary_closes) >= 6:
+            dxy_closes = dxy_data['closes']
+            dxy_5d_change = (dxy_closes[-1] / dxy_closes[-6]) - 1
+            metal_5d_change = (primary_closes[-1] / primary_closes[-6]) - 1
+            if dxy_5d_change >= CRASH_DXY_RISE and metal_5d_change <= CRASH_METAL_DROP:
+                trigger_count += 1
+                triggers.append(f"DXY={dxy_5d_change*100:+.1f}%/Metal={metal_5d_change*100:+.1f}% DIVERGE")
+            else:
+                triggers.append(f"DXY={dxy_5d_change*100:+.1f}%/Metal={metal_5d_change*100:+.1f}% OK")
+        else:
+            triggers.append("DXY/Metal divergence: no data")
+
+        return trigger_count, triggers
+
     def _get_regime(self, primary_metal):
         """
-        Classify market regime for prediction adjustments (advisor-backed).
-        BULL: S&P 500 > 50d MA -> anchor to Gold, full sensitivity.
-        BEAR: S&P 500 < 50d MA -> anchor to S&P 500, apply safety factor.
-        SIDEWAYS: Primary RSI 45-55 -> mean reversion, double ratio weight.
-        Returns (regime_str, sp500_cur, sp500_ma50) or (None, None, None) if no data.
+        Classify market regime with 5 regimes.
+        CRASH: 3/5 crash triggers active. Mean reversion to 20d MA, 30% reversion towards 50d MA.
+        RECOVERY: 10 day buffer after crash. Mean reversion to 20d MA, 20% reversion towards 20d MA.
+        SIDEWAYS: Primary RSI 45-55, 7d/14d SMA momentum, beta 1.0x.
+        BULL: S&P 500 > 20d MA, 7d/14d SMA momentum, beta 1.0x.
+        BEAR: S&P 500 < 20d MA, 7d/14d SMA momentum, beta 0.7x.
+        Returns (regime_str, sp500_cur, sp500_ma, extra_info) where extra_info is a dict.
         """
         sp_data = self.prediction_data.get('SP500_REGIME') if self.prediction_data else None
         if not sp_data or not sp_data.get('closes'):
-            return None, None, None
+            return None, None, None, {}
         closes = sp_data['closes']
         if len(closes) < REGIME_MA_DAYS:
-            return None, None, None
+            return None, None, None, {}
         sp500_cur = closes[-1]
-        sp500_ma50 = sum(closes[-REGIME_MA_DAYS:]) / REGIME_MA_DAYS
+        sp500_ma = sum(closes[-REGIME_MA_DAYS:]) / REGIME_MA_DAYS
+
+        extra_info = {}
+
+        # Check for CRASH first (highest priority)
+        crash_triggers, crash_details = self._detect_crash_triggers(primary_metal)
+        extra_info['crash_triggers'] = crash_triggers
+        extra_info['crash_details'] = crash_details
+
+        if crash_triggers >= CRASH_TRIGGERS_NEEDED:
+            return 'CRASH', sp500_cur, sp500_ma, extra_info
+
+        # Check for RECOVERY (if we were recently in crash)
+        # Use a simple heuristic: if crash triggers were recently high but now below threshold,
+        # and VIX is still elevated (> 20), treat as recovery
+        if not hasattr(self, '_last_crash_timestamp'):
+            self._last_crash_timestamp = None
+        if not hasattr(self, '_recovery_start'):
+            self._recovery_start = None
+
+        # Track crash state for recovery buffer
+        if crash_triggers >= CRASH_TRIGGERS_NEEDED:
+            self._last_crash_timestamp = datetime.now()
+
+        if self._last_crash_timestamp:
+            days_since_crash = (datetime.now() - self._last_crash_timestamp).days
+            if days_since_crash <= RECOVERY_BUFFER_DAYS:
+                if crash_triggers < CRASH_TRIGGERS_NEEDED:
+                    extra_info['recovery_days_remaining'] = RECOVERY_BUFFER_DAYS - days_since_crash
+                    return 'RECOVERY', sp500_cur, sp500_ma, extra_info
+
+        # Check primary RSI for SIDEWAYS
         primary = self.prediction_data.get(primary_metal, {})
         primary_closes = primary.get('closes', [])
         rsi = self.calculate_rsi(primary_closes) if len(primary_closes) >= 15 else None
+
         if rsi is not None and 45 <= rsi <= 55:
-            return 'SIDEWAYS', sp500_cur, sp500_ma50
-        if sp500_cur > sp500_ma50:
-            return 'BULL', sp500_cur, sp500_ma50
-        return 'BEAR', sp500_cur, sp500_ma50
+            return 'SIDEWAYS', sp500_cur, sp500_ma, extra_info
+
+        # BULL vs BEAR based on S&P 500 vs 20d MA
+        if sp500_cur > sp500_ma:
+            return 'BULL', sp500_cur, sp500_ma, extra_info
+        return 'BEAR', sp500_cur, sp500_ma, extra_info
 
     def _correlation_over_period(self, primary_closes, secondary_closes, period):
         """Return Pearson correlation of log returns over the given period (for fast/slow correlation)."""
@@ -1847,67 +2064,151 @@ class MetalCalculatorApp:
         
         return beta, correlation
     
+    def _calculate_macd_histogram(self, closes):
+        """Calculate MACD histogram (MACD line - Signal line) using 12/26/9 EMA."""
+        if len(closes) < 35:
+            return None
+        # EMA helper
+        def ema(data, period):
+            multiplier = 2 / (period + 1)
+            result = [sum(data[:period]) / period]
+            for i in range(period, len(data)):
+                result.append((data[i] - result[-1]) * multiplier + result[-1])
+            return result
+
+        ema12 = ema(closes, 12)
+        ema26 = ema(closes, 26)
+        # Align lengths (ema26 starts later)
+        offset = 26 - 12
+        macd_line = [ema12[i + offset] - ema26[i] for i in range(len(ema26))]
+        if len(macd_line) < 9:
+            return None
+        signal_line = ema(macd_line, 9)
+        # Histogram is last value of macd_line - last value of signal_line
+        histogram = macd_line[-1] - signal_line[-1]
+        return histogram
+
     def calculate_prediction(self, primary_metal, secondary_name):
-        """Calculate predicted price using log returns, adaptive ratio pressure, dynamic beta, and advisor-backed regime/clamp logic."""
+        """Calculate predicted price using v4 regime-aware logic with 5 regimes."""
         if primary_metal not in self.prediction_data or secondary_name not in self.prediction_data:
             return None
-        
+
         primary = self.prediction_data[primary_metal]
         secondary = self.prediction_data[secondary_name]
-        
+
         primary_closes = primary['closes']
         secondary_closes = secondary['closes']
-        
+
         if len(primary_closes) < 30 or len(secondary_closes) < 30:
             return None
-        
+
         # Current prices
         primary_cur = primary_closes[-1]
         secondary_cur = secondary_closes[-1]
-        
-        # Regime detection (S&P 500 vs 50d MA + primary RSI)
-        regime, sp500_cur, sp500_ma50 = self._get_regime(primary_metal)
-        
+
+        # Regime detection (5 regimes: CRASH, RECOVERY, SIDEWAYS, BULL, BEAR)
+        regime, sp500_cur, sp500_ma, regime_extra = self._get_regime(primary_metal)
+
         # Dual correlation: fast (10d) vs slow (60d) for regime-change detection
         corr_slow = self._correlation_over_period(primary_closes, secondary_closes, 60)
         corr_fast = self._correlation_over_period(primary_closes, secondary_closes, CORRELATION_FAST_DAYS)
         regime_change = abs(corr_fast - corr_slow) > CORRELATION_REGIME_DIVERGENCE
-        
-        # Calculate averages for secondary (for momentum)
-        secondary_7davg = sum(secondary_closes[-7:]) / 7
-        secondary_14davg = sum(secondary_closes[-14:]) / 14
-        
-        # STEP 1: Calculate secondary's momentum using LOG returns
-        if secondary_14davg <= 0 or secondary_7davg <= 0:
-            return None
-        secondary_momentum_log = math.log(secondary_7davg / secondary_14davg)
-        secondary_momentum = math.exp(secondary_momentum_log) - 1
-        
-        # STEP 2: Dynamic beta; shrink in bear regime or regime change (advisor: beta amplifies errors in crashes)
-        beta, correlation = self.calculate_beta(primary_closes, secondary_closes)
-        beta_for_move = beta
-        if regime == 'BEAR' or regime_change:
-            beta_for_move = beta * REGIME_BETA_SHRINK
-        
-        # Expected move with dynamic clamp (advisor: static ±10% caught zero of 31 moves >10%)
-        primary_expected_move = secondary_momentum * beta_for_move
+
+        # ATR and volatility
+        atr_val = None
         volatility_pct = None
         if primary_cur > 0:
             atr_val = self.calculate_atr(primary.get('highs', []), primary.get('lows', []), primary_closes)
             volatility_pct = (atr_val / primary_cur) * 100 if atr_val else 0
-        if volatility_pct is not None and (volatility_pct >= VOLATILITY_CRISIS_PCT or regime_change):
+
+        # === MOMENTUM CALCULATION (regime-dependent) ===
+        if regime == 'CRASH':
+            # Mean reversion to 20d MA momentum calculation
+            if len(primary_closes) >= REGIME_MA_DAYS:
+                ma_20d = sum(primary_closes[-REGIME_MA_DAYS:]) / REGIME_MA_DAYS
+                # Reversion: 30% towards 50d MA
+                if len(primary_closes) >= CRASH_REVERSION_MA:
+                    ma_50d = sum(primary_closes[-CRASH_REVERSION_MA:]) / CRASH_REVERSION_MA
+                    reversion_target = primary_cur + CRASH_REVERSION_FACTOR * (ma_50d - primary_cur)
+                    secondary_momentum = (reversion_target / primary_cur) - 1
+                else:
+                    secondary_momentum = (ma_20d / primary_cur) - 1
+            else:
+                secondary_momentum = 0
+        elif regime == 'RECOVERY':
+            # Mean reversion to 20d MA momentum calculation
+            if len(primary_closes) >= RECOVERY_REVERSION_MA:
+                ma_20d = sum(primary_closes[-RECOVERY_REVERSION_MA:]) / RECOVERY_REVERSION_MA
+                reversion_target = primary_cur + RECOVERY_REVERSION_FACTOR * (ma_20d - primary_cur)
+                secondary_momentum = (reversion_target / primary_cur) - 1
+            else:
+                secondary_momentum = 0
+        else:
+            # SIDEWAYS, BULL, BEAR: 7d/14d SMA momentum calculation
+            secondary_7davg = sum(secondary_closes[-7:]) / 7
+            secondary_14davg = sum(secondary_closes[-14:]) / 14
+            if secondary_14davg <= 0 or secondary_7davg <= 0:
+                return None
+            secondary_momentum_log = math.log(secondary_7davg / secondary_14davg)
+            secondary_momentum = math.exp(secondary_momentum_log) - 1
+
+        # === DYNAMIC BETA with regime adjustment ===
+        beta, correlation = self.calculate_beta(primary_closes, secondary_closes)
+        beta_for_move = beta
+
+        if regime == 'CRASH' or regime == 'RECOVERY':
+            # Crash/Recovery use mean reversion, beta not applied to momentum
+            beta_for_move = 1.0
+        elif regime == 'SIDEWAYS':
+            beta_for_move = beta * 1.0  # full beta
+        elif regime == 'BULL':
+            beta_for_move = beta * 1.0  # full beta
+        elif regime == 'BEAR':
+            beta_for_move = beta * BEAR_BETA_SHRINK  # 0.7x
+
+        # Apply regime change shrink on top
+        if regime_change and regime not in ('CRASH', 'RECOVERY'):
+            beta_for_move = beta_for_move * REGIME_BETA_SHRINK
+
+        # Expected move
+        primary_expected_move = secondary_momentum * beta_for_move
+
+        # === DYNAMIC CLAMP (regime-dependent) ===
+        if regime == 'CRASH':
+            # Dynamic σ-based clamp (3σ max)
+            if atr_val and primary_cur > 0:
+                # Use daily returns std dev * sqrt(7) for weekly σ
+                if len(primary_closes) >= 21:
+                    daily_returns = []
+                    for i in range(-20, 0):
+                        if primary_closes[i - 1] > 0:
+                            daily_returns.append(primary_closes[i] / primary_closes[i - 1] - 1)
+                    if daily_returns:
+                        mean_ret = sum(daily_returns) / len(daily_returns)
+                        variance = sum((r - mean_ret) ** 2 for r in daily_returns) / len(daily_returns)
+                        daily_sigma = math.sqrt(variance)
+                        weekly_sigma = daily_sigma * SQRT_7
+                        clamp = min(weekly_sigma * CLAMP_CRASH_SIGMA, 0.50)  # cap at 50% max
+                    else:
+                        clamp = CLAMP_CRISIS
+                else:
+                    clamp = CLAMP_CRISIS
+            else:
+                clamp = CLAMP_CRISIS
+        elif regime == 'RECOVERY':
+            clamp = CLAMP_RECOVERY
+        elif regime_change:
+            clamp = CLAMP_CRISIS
+        elif volatility_pct is not None and volatility_pct >= VOLATILITY_CRISIS_PCT:
             clamp = CLAMP_CRISIS
         elif volatility_pct is not None and volatility_pct >= VOLATILITY_ELEVATED_PCT:
             clamp = CLAMP_ELEVATED
         else:
             clamp = CLAMP_NORMAL
+
         primary_expected_move = max(-clamp, min(clamp, primary_expected_move))
-        
-        # Bear regime: apply safety factor (advisor: 23% accuracy in down markets; 0.8x ExpectedMove)
-        if regime == 'BEAR':
-            primary_expected_move *= BEAR_SAFETY_FACTOR
-        
-        # STEP 3: Ratio and mean reversion pressure
+
+        # === RATIO AND MEAN REVERSION PRESSURE ===
         current_ratio = secondary_cur / primary_cur if primary_cur > 0 else 0
         if len(primary_closes) >= 28 and len(secondary_closes) >= 28:
             ratio_history = []
@@ -1917,30 +2218,41 @@ class MetalCalculatorApp:
             avg_ratio = sum(ratio_history) / len(ratio_history) if ratio_history else current_ratio
         else:
             avg_ratio = current_ratio
-        
+
         ratio_deviation = (current_ratio - avg_ratio) / avg_ratio if avg_ratio > 0 else 0
-        
+
+        # Base multiplier: |ρ| × 0.15
         if correlation < 0:
-            pressure_multiplier = 0
+            pressure_multiplier = 0  # Negative correlation pressure = 0
         else:
-            pressure_multiplier = abs(correlation) * 0.15
-        
-        # SIDEWAYS: double ratio pressure (advisor: mean reversion)
+            pressure_multiplier = abs(correlation) * RATIO_BASE_MULTIPLIER_FACTOR
+
+        # SIDEWAYS: 2.0x boost
         if regime == 'SIDEWAYS':
-            pressure_multiplier *= 2.0
-        
+            pressure_multiplier *= RATIO_SIDEWAYS_BOOST
+
         ratio_pressure = ratio_deviation * pressure_multiplier
-        
-        # Bearish filter (advisor: model predicts rebound in downtrends; zero ratio pressure when primary 14d momentum negative)
+
+        # Bear disable condition: primary 14d momentum < 0
         primary_14d_momentum = None
         if len(primary_closes) >= 15 and primary_closes[-15] > 0:
             primary_14d_momentum = (primary_closes[-1] / primary_closes[-15]) - 1
-        if primary_14d_momentum is not None and primary_14d_momentum < 0:
-            ratio_pressure = 0.0  # disable ratio pressure in downtrends to avoid false "buy" signals
-        
-        # STEP 4: Combine for prediction
+        if regime == 'BEAR' and primary_14d_momentum is not None and primary_14d_momentum < 0:
+            ratio_pressure = 0.0
+
+        # Bull disable condition: MACD histogram < 0
+        if regime == 'BULL':
+            macd_hist = self._calculate_macd_histogram(secondary_closes)
+            if macd_hist is not None and macd_hist < 0:
+                ratio_pressure = 0.0
+
+        # No ratio pressure in crash/recovery (mean reversion handles it)
+        if regime in ('CRASH', 'RECOVERY'):
+            ratio_pressure = 0.0
+
+        # === FINAL PREDICTION ===
         predicted_price = primary_cur * (1 + primary_expected_move + ratio_pressure)
-        
+
         return {
             'predicted_price': predicted_price,
             'current_price': primary_cur,
@@ -1955,6 +2267,7 @@ class MetalCalculatorApp:
             'correlation': correlation,
             'regime': regime,
             'regime_change': regime_change,
+            'regime_extra': regime_extra,
             'clamp_used': clamp,
             'correlation_fast': corr_fast,
             'correlation_slow': corr_slow,
@@ -1962,101 +2275,38 @@ class MetalCalculatorApp:
         }
     
     def calculate_confidence(self, primary_metal, secondary_name, prediction_result):
-        """Calculate confidence percentage based on 6 weighted factors"""
+        """Calculate confidence percentage based on 8 weighted factors (v4)."""
         if not prediction_result:
             return 0, []
-        
+
         primary = self.prediction_data.get(primary_metal, {})
         secondary = self.prediction_data.get(secondary_name, {})
         dxy_data = self.prediction_data.get('DXY', None)
-        
+
         signals = []
         confidence_points = 0
-        
-        # v3 weights (advisor-backed): Correlation 50%, DXY 15%, Regime Fit 15%, RSI 10%, Volatility 10%, Ratio 10%
+
+        # v4 weights: Correlation 40%, DXY 7%(4% copper), Regime Fit 10%, RSI 10%,
+        #             Volatility 5%, Ratio 10%, RSI Divergence 8%, Correlation Agreement 10%
         is_copper = (primary_metal == 'Copper')
-        W_CORRELATION = 50
-        W_DXY = 15 if not is_copper else 5   # Copper: less $ sensitivity
-        W_REGIME_FIT = 15
-        W_RSI = 10
-        W_VOLATILITY = 10
-        W_RATIO = 10
-        max_points = W_CORRELATION + W_DXY + W_REGIME_FIT + W_RSI + W_VOLATILITY + W_RATIO
-        
+        W_CORRELATION = CONF_W_CORRELATION          # 40
+        W_DXY = CONF_W_DXY_COPPER if is_copper else CONF_W_DXY  # 4 or 7
+        W_REGIME_FIT = CONF_W_REGIME_FIT            # 10
+        W_RSI = CONF_W_RSI                          # 10
+        W_VOLATILITY = CONF_W_VOLATILITY            # 5
+        W_RATIO = CONF_W_RATIO                      # 10
+        W_RSI_DIVERGENCE = CONF_W_RSI_DIVERGENCE    # 8
+        W_CORR_AGREEMENT = CONF_W_CORR_AGREEMENT    # 10
+        max_points = W_CORRELATION + W_DXY + W_REGIME_FIT + W_RSI + W_VOLATILITY + W_RATIO + W_RSI_DIVERGENCE + W_CORR_AGREEMENT
+
         primary_closes = primary.get('closes', [])
         secondary_closes = secondary.get('closes', [])
         regime = prediction_result.get('regime')
         regime_change = prediction_result.get('regime_change', False)
-        ratio_deviation_abs = abs(prediction_result.get('ratio_deviation', 0)) / 100  # for ratio + regime
-        
+        ratio_deviation_abs = abs(prediction_result.get('ratio_deviation', 0)) / 100
+
         # =====================
-        # FACTOR 1: Regime Fit (primary and secondary in sync with advisor recommendations)
-        # =====================
-        regime_fit = False
-        if regime == 'BULL' and secondary_name == 'Gold':
-            regime_fit = True
-            regime_desc = "Bull + Gold anchor"
-        elif regime == 'BEAR' and secondary_name == 'S&P 500':
-            regime_fit = True
-            regime_desc = "Bear + S&P 500 anchor"
-        elif regime == 'SIDEWAYS' and ratio_deviation_abs < 0.10:
-            regime_fit = True
-            regime_desc = "Sideways + stable ratio"
-        else:
-            regime_desc = f"Regime {regime or '?'} / {secondary_name}"
-        if regime_fit:
-            confidence_points += W_REGIME_FIT
-            signals.append(("Regime Fit", f"✓ {regime_desc} (+{W_REGIME_FIT}pts)", True))
-        else:
-            signals.append(("Regime Fit", f"△ {regime_desc} (+0pts)", False))
-        
-        # =====================
-        # FACTOR 2: RSI not extreme (30-70 range)
-        # =====================
-        rsi = self.calculate_rsi(primary_closes)
-        if rsi is not None:
-            if 30 <= rsi <= 70:
-                confidence_points += W_RSI
-                signals.append(("RSI Range", f"✓ RSI ({rsi:.1f}) neutral (+{W_RSI}pts)", True))
-            elif 20 <= rsi < 30 or 70 < rsi <= 80:
-                half_pts = W_RSI // 2
-                confidence_points += half_pts
-                signals.append(("RSI Range", f"△ RSI ({rsi:.1f}) near extreme (+{half_pts}pts)", False))
-            else:
-                signals.append(("RSI Range", f"✗ RSI ({rsi:.1f}) extreme (+0pts)", False))
-        
-        # =====================
-        # FACTOR 3: Low volatility (ATR < 2% of price)
-        # =====================
-        atr = self.calculate_atr(primary.get('highs', []), primary.get('lows', []), primary_closes)
-        if atr is not None and len(primary_closes) > 0:
-            current_price = primary_closes[-1]
-            volatility_pct = (atr / current_price) * 100 if current_price > 0 else 0
-            if volatility_pct < 2:
-                confidence_points += W_VOLATILITY
-                signals.append(("Volatility", f"✓ Low ({volatility_pct:.1f}%) (+{W_VOLATILITY}pts)", True))
-            elif volatility_pct < 4:
-                half_pts = W_VOLATILITY // 2
-                confidence_points += half_pts
-                signals.append(("Volatility", f"△ Moderate ({volatility_pct:.1f}%) (+{half_pts}pts)", False))
-            else:
-                signals.append(("Volatility", f"✗ High ({volatility_pct:.1f}%) (+0pts)", False))
-        
-        # =====================
-        # FACTOR 4: Ratio near historical average (within 5%)
-        # =====================
-        if ratio_deviation_abs < 0.05:
-            confidence_points += W_RATIO
-            signals.append(("Ratio Stability", f"✓ Near average ({ratio_deviation_abs*100:.1f}% dev) (+{W_RATIO}pts)", True))
-        elif ratio_deviation_abs < 0.15:
-            half_pts = W_RATIO // 2
-            confidence_points += half_pts
-            signals.append(("Ratio Stability", f"△ Extended ({ratio_deviation_abs*100:.1f}% dev) (+{half_pts}pts)", False))
-        else:
-            signals.append(("Ratio Stability", f"✗ Far from avg ({ratio_deviation_abs*100:.1f}% dev) (+0pts)", False))
-        
-        # =====================
-        # FACTOR 5: Correlation strength (50% weight - strongest predictor in backtests)
+        # FACTOR 1: Correlation (60d) - 40%
         # =====================
         correlation = prediction_result.get('correlation', 0)
         abs_corr = abs(correlation)
@@ -2073,9 +2323,9 @@ class MetalCalculatorApp:
             signals.append(("Correlation", f"✗ Weak ({correlation:.2f}) (+{quarter_pts}pts)", False))
         else:
             signals.append(("Correlation", f"✗ Very weak ({correlation:.2f}) - beta unreliable (+0pts)", False))
-        
+
         # =====================
-        # FACTOR 6: DXY Health (inverse correlation with precious metals)
+        # FACTOR 2: DXY Health - 7% (4% copper)
         # =====================
         if dxy_data is not None and 'closes' in dxy_data:
             dxy_closes = dxy_data['closes']
@@ -2096,13 +2346,134 @@ class MetalCalculatorApp:
                 signals.append(("DXY Health", "? Insufficient DXY data", False))
         else:
             signals.append(("DXY Health", "? DXY data unavailable", False))
-        
+
+        # =====================
+        # FACTOR 3: Regime Fit - 10%
+        # =====================
+        regime_fit = False
+        if regime == 'BULL' and secondary_name == 'Gold':
+            regime_fit = True
+            regime_desc = "Bull + Gold anchor"
+        elif regime == 'BEAR' and secondary_name == 'S&P 500':
+            regime_fit = True
+            regime_desc = "Bear + S&P 500 anchor"
+        elif regime == 'SIDEWAYS' and ratio_deviation_abs < 0.10:
+            regime_fit = True
+            regime_desc = "Sideways + stable ratio"
+        elif regime == 'CRASH':
+            regime_fit = True  # crash regime is always a "fit" since it overrides
+            regime_desc = "Crash - mean reversion active"
+        elif regime == 'RECOVERY':
+            regime_fit = True
+            regime_desc = "Recovery - buffer active"
+        else:
+            regime_desc = f"Regime {regime or '?'} / {secondary_name}"
+        if regime_fit:
+            confidence_points += W_REGIME_FIT
+            signals.append(("Regime Fit", f"✓ {regime_desc} (+{W_REGIME_FIT}pts)", True))
+        else:
+            signals.append(("Regime Fit", f"△ {regime_desc} (+0pts)", False))
+
+        # =====================
+        # FACTOR 4: RSI Range - 10%
+        # =====================
+        rsi = self.calculate_rsi(primary_closes)
+        if rsi is not None:
+            if 30 <= rsi <= 70:
+                confidence_points += W_RSI
+                signals.append(("RSI Range", f"✓ RSI ({rsi:.1f}) neutral (+{W_RSI}pts)", True))
+            elif 20 <= rsi < 30 or 70 < rsi <= 80:
+                half_pts = W_RSI // 2
+                confidence_points += half_pts
+                signals.append(("RSI Range", f"△ RSI ({rsi:.1f}) near extreme (+{half_pts}pts)", False))
+            else:
+                signals.append(("RSI Range", f"✗ RSI ({rsi:.1f}) extreme (+0pts)", False))
+
+        # =====================
+        # FACTOR 5: Volatility - 5%
+        # =====================
+        atr = self.calculate_atr(primary.get('highs', []), primary.get('lows', []), primary_closes)
+        if atr is not None and len(primary_closes) > 0:
+            current_price = primary_closes[-1]
+            volatility_pct = (atr / current_price) * 100 if current_price > 0 else 0
+            if volatility_pct < 2:
+                confidence_points += W_VOLATILITY
+                signals.append(("Volatility", f"✓ Low ({volatility_pct:.1f}%) (+{W_VOLATILITY}pts)", True))
+            elif volatility_pct < 4:
+                half_pts = W_VOLATILITY // 2
+                confidence_points += half_pts
+                signals.append(("Volatility", f"△ Moderate ({volatility_pct:.1f}%) (+{half_pts}pts)", False))
+            else:
+                signals.append(("Volatility", f"✗ High ({volatility_pct:.1f}%) (+0pts)", False))
+
+        # =====================
+        # FACTOR 6: Ratio Stability - 10%
+        # =====================
+        if ratio_deviation_abs < 0.05:
+            confidence_points += W_RATIO
+            signals.append(("Ratio Stability", f"✓ Near average ({ratio_deviation_abs*100:.1f}% dev) (+{W_RATIO}pts)", True))
+        elif ratio_deviation_abs < 0.15:
+            half_pts = W_RATIO // 2
+            confidence_points += half_pts
+            signals.append(("Ratio Stability", f"△ Extended ({ratio_deviation_abs*100:.1f}% dev) (+{half_pts}pts)", False))
+        else:
+            signals.append(("Ratio Stability", f"✗ Far from avg ({ratio_deviation_abs*100:.1f}% dev) (+0pts)", False))
+
+        # =====================
+        # FACTOR 7: RSI Divergence - 8%
+        # Price making new highs/lows but RSI isn't confirming
+        # =====================
+        rsi_divergence_pts = 0
+        if rsi is not None and len(primary_closes) >= 14:
+            # Check if price trend matches RSI trend (last 14 days)
+            price_trend = (primary_closes[-1] / primary_closes[-14]) - 1
+
+            # Calculate RSI from 14 days ago for comparison
+            if len(primary_closes) >= 28:
+                rsi_old = self.calculate_rsi(primary_closes[:-14])
+                if rsi_old is not None:
+                    rsi_trend = rsi - rsi_old
+                    # Divergence: price up but RSI down, or price down but RSI up
+                    if (price_trend > 0.02 and rsi_trend < -5) or (price_trend < -0.02 and rsi_trend > 5):
+                        # Divergence detected - this is informative but lowers confidence
+                        signals.append(("RSI Divergence", f"✗ Divergence detected (price {price_trend*100:+.1f}%, RSI {rsi_trend:+.1f}) (+0pts)", False))
+                    else:
+                        # No divergence - price and RSI agree
+                        rsi_divergence_pts = W_RSI_DIVERGENCE
+                        confidence_points += rsi_divergence_pts
+                        signals.append(("RSI Divergence", f"✓ Price/RSI aligned (+{W_RSI_DIVERGENCE}pts)", True))
+                else:
+                    signals.append(("RSI Divergence", "? Insufficient RSI history", False))
+            else:
+                signals.append(("RSI Divergence", "? Insufficient data for RSI divergence", False))
+        else:
+            signals.append(("RSI Divergence", "? RSI unavailable", False))
+
+        # =====================
+        # FACTOR 8: Correlation Agreement - 10%
+        # Fast (10d) and slow (60d) correlations should agree in sign and magnitude
+        # =====================
+        corr_fast = prediction_result.get('correlation_fast', 0)
+        corr_slow = prediction_result.get('correlation_slow', 0)
+        corr_diff = abs(corr_fast - corr_slow)
+        if corr_diff < 0.15 and (corr_fast * corr_slow > 0):
+            # Strong agreement: same sign and close magnitude
+            confidence_points += W_CORR_AGREEMENT
+            signals.append(("Corr Agreement", f"✓ Fast/slow aligned ({corr_fast:.2f}/{corr_slow:.2f}, diff={corr_diff:.2f}) (+{W_CORR_AGREEMENT}pts)", True))
+        elif corr_diff < 0.30 and (corr_fast * corr_slow > 0):
+            # Moderate agreement
+            half_pts = W_CORR_AGREEMENT // 2
+            confidence_points += half_pts
+            signals.append(("Corr Agreement", f"△ Partial alignment ({corr_fast:.2f}/{corr_slow:.2f}, diff={corr_diff:.2f}) (+{half_pts}pts)", False))
+        else:
+            signals.append(("Corr Agreement", f"✗ Fast/slow diverging ({corr_fast:.2f}/{corr_slow:.2f}, diff={corr_diff:.2f}) (+0pts)", False))
+
         confidence_pct = (confidence_points / max_points) * 100 if max_points > 0 else 0
-        # Cap confidence when regime change detected (advisor: algorithm most confident right before it fails)
+        # Cap confidence when regime change detected
         if regime_change:
             confidence_pct = min(confidence_pct, CONFIDENCE_CAP_REGIME_CHANGE)
             signals.append(("Regime Change", f"⚠ Confidence capped at {CONFIDENCE_CAP_REGIME_CHANGE}% (fast/slow correlation divergence)", False))
-        
+
         return confidence_pct, signals
     
     def _calculate_simple_correlation(self, series1, series2):
@@ -2281,13 +2652,45 @@ class MetalCalculatorApp:
                 clamp_used = prediction.get('clamp_used', CLAMP_NORMAL)
                 regime_change = prediction.get('regime_change', False)
                 clamp_pct = int(clamp_used * 100)
+                regime_extra = prediction.get('regime_extra', {})
+                crash_details = regime_extra.get('crash_details', [])
+                crash_triggers = regime_extra.get('crash_triggers', 0)
+
+                # Format clamp display
+                if regime == 'CRASH':
+                    clamp_desc = f"dynamic σ-based ({clamp_pct}%)"
+                else:
+                    clamp_desc = f"±{clamp_pct}%"
+
                 breakdown_lines = [
-                    f"Prediction Formula Breakdown (v3):",
+                    f"Prediction Formula Breakdown (v4):",
                     f"  Regime: {regime}" + ("  ⚠ Regime change (fast/slow correlation divergence)" if regime_change else ""),
-                    f"  1. {secondary_metal} Momentum (7d vs 14d): {prediction['secondary_momentum']:+.2f}%",
+                ]
+
+                # Add crash detection details if available
+                if crash_details:
+                    breakdown_lines.append(f"  Crash Triggers: {crash_triggers}/5 (need {CRASH_TRIGGERS_NEEDED})")
+                    for detail in crash_details:
+                        breakdown_lines.append(f"     • {detail}")
+
+                if regime == 'RECOVERY':
+                    remaining = regime_extra.get('recovery_days_remaining', '?')
+                    breakdown_lines.append(f"  Recovery buffer: {remaining} days remaining")
+
+                # Momentum description varies by regime
+                if regime in ('CRASH', 'RECOVERY'):
+                    breakdown_lines.append(f"  1. Mean Reversion Momentum: {prediction['secondary_momentum']:+.2f}%")
+                    if regime == 'CRASH':
+                        breakdown_lines.append(f"     → 30% reversion towards 50d MA")
+                    else:
+                        breakdown_lines.append(f"     → 20% reversion towards 20d MA")
+                else:
+                    breakdown_lines.append(f"  1. {secondary_metal} Momentum (7d vs 14d SMA): {prediction['secondary_momentum']:+.2f}%")
+
+                breakdown_lines.extend([
                     f"  2. Dynamic Beta (60-day, log returns): {prediction['beta']:.2f}x",
                     f"     → Correlation 60d: {prediction.get('correlation_slow', correlation):.2f}  10d: {prediction.get('correlation_fast', 0):.2f}",
-                    f"     → Expected {primary_metal} move: {prediction['primary_expected_move']:+.2f}% (clamped ±{clamp_pct}%)",
+                    f"     → Expected {primary_metal} move: {prediction['primary_expected_move']:+.2f}% (clamped {clamp_desc})",
                     f"  3. {secondary_metal}/{primary_metal} Ratio: {prediction['current_ratio']:.2f} (28d avg: {prediction['avg_ratio']:.2f})",
                     f"     → Ratio Deviation: {prediction['ratio_deviation']:+.2f}%",
                     f"  4. Adaptive Ratio Pressure: {prediction['ratio_pressure']:+.2f}%",
@@ -2295,8 +2698,8 @@ class MetalCalculatorApp:
                     f"",
                     f"Price Range: ATR × √7 = {atr:.4f} × {SQRT_7:.2f} = ±${atr * SQRT_7:.4f}" if atr else f"Price Range: N/A",
                     f"",
-                    f"Confidence (v3: Regime Fit, Correlation 50%, cap when regime change):"
-                ]
+                    f"Confidence (v4: 8-factor, Correlation 40%, cap when regime change):"
+                ])
                 for signal_name, signal_desc, signal_positive in signals:
                     breakdown_lines.append(f"  • {signal_desc}")
                 
@@ -2366,9 +2769,10 @@ class MetalCalculatorApp:
                     'ratio_pressure': prediction.get('ratio_pressure'),
                     'pressure_multiplier': prediction.get('pressure_multiplier'),
                     
-                    # v3 regime and clamp (advisor-backed)
+                    # v4 regime and clamp
                     'regime': prediction.get('regime'),
                     'regime_change': prediction.get('regime_change'),
+                    'regime_extra': prediction.get('regime_extra', {}),
                     'clamp_used': prediction.get('clamp_used'),
                     'correlation_fast': prediction.get('correlation_fast'),
                     'correlation_slow': prediction.get('correlation_slow'),
