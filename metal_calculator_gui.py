@@ -875,9 +875,15 @@ class MetalCalculatorApp:
         self.pred_save_btn = ttk.Button(select_grid, text="💾 Save Prediction", command=self.save_current_prediction, state='disabled')
         self.pred_save_btn.grid(row=0, column=5, padx=(5, 0), pady=5)
 
-        # Back Test button
+        # Back Test button with months selector
+        self.backtest_months_var = tk.StringVar(value='12')
+        backtest_months_combo = ttk.Combobox(select_grid, textvariable=self.backtest_months_var,
+                                              state='readonly', width=4)
+        backtest_months_combo['values'] = [str(m) for m in range(6, 61)]
+        backtest_months_combo.grid(row=0, column=6, padx=(10, 0), pady=5)
+        ttk.Label(select_grid, text="mo", font=('Segoe UI', 8)).grid(row=0, column=7, sticky='w', padx=(1, 0), pady=5)
         self.pred_backtest_btn = ttk.Button(select_grid, text="📉 Back Test", command=self.run_backtest_thread)
-        self.pred_backtest_btn.grid(row=0, column=6, padx=(5, 0), pady=5)
+        self.pred_backtest_btn.grid(row=0, column=8, padx=(2, 0), pady=5)
         
         self.pred_status_var = tk.StringVar(value="Select metals and click 'Fetch Prediction Data'")
         ttk.Label(select_frame, textvariable=self.pred_status_var, foreground="gray", font=('Segoe UI', 9)).pack(anchor='w', pady=(5, 0))
@@ -1528,31 +1534,34 @@ class MetalCalculatorApp:
     # PREDICTION METHODS
     # =========================================================================
     
-    def fetch_yf_history_with_retry(self, ticker_symbol, period="3mo", timeout=30, max_retries=2):
+    def fetch_yf_history_with_retry(self, ticker_symbol, period="3mo", timeout=30, max_retries=2, start=None):
         """
         Fetch Yahoo Finance history with timeout and retry logic.
-        
+
         Args:
             ticker_symbol: Yahoo Finance ticker (e.g., 'GC=F', 'SI=F')
-            period: History period (e.g., '3mo', '1y')
+            period: History period (e.g., '3mo', '1y') - used when start is None
             timeout: Timeout in seconds per attempt
             max_retries: Number of retry attempts
-            
+            start: Optional start date string ('YYYY-MM-DD'). If provided, period is ignored.
+
         Returns:
             tuple: (history_dataframe, error_message)
             - On success: (DataFrame, None)
             - On failure: (None, "error description")
         """
         import concurrent.futures
-        
+
         last_error = None
-        
+
         for attempt in range(max_retries):
             try:
                 # Use ThreadPoolExecutor for timeout control
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                     def fetch_data():
                         ticker = yf.Ticker(ticker_symbol)
+                        if start:
+                            return ticker.history(start=start)
                         return ticker.history(period=period)
                     
                     future = executor.submit(fetch_data)
@@ -2916,15 +2925,17 @@ class MetalCalculatorApp:
     def run_backtest_thread(self):
         """Start the backtest in a separate thread"""
         self.pred_backtest_btn.config(state='disabled')
-        self.pred_status_var.set("Starting back test (fetching 18 months of data)...")
+        months = self.backtest_months_var.get()
+        self.pred_status_var.set(f"Starting back test ({months} months of data)...")
         thread = threading.Thread(target=self.run_backtest, daemon=True)
         thread.start()
 
     def run_backtest(self):
         """
-        Run a 365-day backtest using the prediction algorithm.
+        Run a backtest using the prediction algorithm over the user-selected
+        number of months (6-60).
 
-        For each trading day in the past year (excluding the last 7 days),
+        For each trading day in that period (excluding the last 7 days),
         simulates a prediction using only data available up to that date,
         then compares with the actual price 7 days later. Results are
         exported to CSV with grades and error metrics.
@@ -2934,6 +2945,7 @@ class MetalCalculatorApp:
         try:
             primary_metal = self.pred_primary_var.get()
             secondary_name = self.pred_secondary_var.get()
+            backtest_months = int(self.backtest_months_var.get())
 
             if primary_metal == secondary_name:
                 self.root.after(0, lambda: messagebox.showwarning(
@@ -2942,44 +2954,47 @@ class MetalCalculatorApp:
                 self.root.after(0, lambda: self.pred_status_var.set("Back test cancelled"))
                 return
 
-            # === Fetch extended historical data (18 months for sufficient lookback) ===
-            fetch_period = "18mo"
+            # === Fetch historical data ===
+            # Need backtest_months + ~3 months extra for algorithm lookback (60d correlation, etc.)
+            total_months_needed = backtest_months + 3
+            fetch_start_date = (datetime.now() - timedelta(days=total_months_needed * 31)).strftime('%Y-%m-%d')
+            fetch_period_label = f"{backtest_months}mo"
 
             def update_status(msg):
                 self.root.after(0, lambda: self.pred_status_var.set(msg))
 
-            update_status(f"Back test: Fetching {primary_metal} (18mo)...")
+            update_status(f"Back test: Fetching {primary_metal} ({fetch_period_label})...")
             primary_config = METALS[primary_metal]
             primary_hist, primary_err = self.fetch_yf_history_with_retry(
-                primary_config['yf_ticker'], period=fetch_period, timeout=60, max_retries=3)
+                primary_config['yf_ticker'], start=fetch_start_date, timeout=60, max_retries=3)
             if primary_err:
                 raise Exception(f"Could not fetch {primary_metal}: {primary_err}")
 
-            update_status(f"Back test: Fetching {secondary_name} (18mo)...")
+            update_status(f"Back test: Fetching {secondary_name} ({fetch_period_label})...")
             secondary_config = PREDICTION_SECONDARIES[secondary_name]
             secondary_hist, secondary_err = self.fetch_yf_history_with_retry(
-                secondary_config['yf_ticker'], period=fetch_period, timeout=60, max_retries=3)
+                secondary_config['yf_ticker'], start=fetch_start_date, timeout=60, max_retries=3)
             if secondary_err:
                 raise Exception(f"Could not fetch {secondary_name}: {secondary_err}")
 
-            update_status("Back test: Fetching DXY (18mo)...")
+            update_status(f"Back test: Fetching DXY ({fetch_period_label})...")
             dxy_hist, dxy_err = self.fetch_yf_history_with_retry(
-                DXY_TICKER, period=fetch_period, timeout=60, max_retries=3)
+                DXY_TICKER, start=fetch_start_date, timeout=60, max_retries=3)
             if dxy_err:
                 raise Exception(f"Could not fetch DXY: {dxy_err}")
 
-            update_status("Back test: Fetching S&P 500 (18mo)...")
+            update_status(f"Back test: Fetching S&P 500 ({fetch_period_label})...")
             if secondary_name == 'S&P 500':
                 sp500_hist = secondary_hist
             else:
                 sp500_hist, sp_err = self.fetch_yf_history_with_retry(
-                    SP500_TICKER_REGIME, period=fetch_period, timeout=60, max_retries=3)
+                    SP500_TICKER_REGIME, start=fetch_start_date, timeout=60, max_retries=3)
                 if sp_err:
                     sp500_hist = None
 
-            update_status("Back test: Fetching VIX (18mo)...")
+            update_status(f"Back test: Fetching VIX ({fetch_period_label})...")
             vix_hist, vix_err = self.fetch_yf_history_with_retry(
-                VIX_TICKER, period=fetch_period, timeout=60, max_retries=3)
+                VIX_TICKER, start=fetch_start_date, timeout=60, max_retries=3)
             if vix_err:
                 vix_hist = None
 
@@ -2989,13 +3004,13 @@ class MetalCalculatorApp:
             if primary_metal != 'Gold' and secondary_name != 'Gold':
                 update_status("Back test: Fetching Gold (GSR)...")
                 gold_hist, _ = self.fetch_yf_history_with_retry(
-                    METALS['Gold']['yf_ticker'], period=fetch_period, timeout=60, max_retries=3)
+                    METALS['Gold']['yf_ticker'], start=fetch_start_date, timeout=60, max_retries=3)
                 if gold_hist is not None and not gold_hist.empty:
                     gold_gsr_closes = [float(p) / TROY_OUNCE_TO_GRAMS for p in gold_hist['Close']]
             if primary_metal != 'Silver' and secondary_name != 'Silver':
                 update_status("Back test: Fetching Silver (GSR)...")
                 silver_hist, _ = self.fetch_yf_history_with_retry(
-                    METALS['Silver']['yf_ticker'], period=fetch_period, timeout=60, max_retries=3)
+                    METALS['Silver']['yf_ticker'], start=fetch_start_date, timeout=60, max_retries=3)
                 if silver_hist is not None and not silver_hist.empty:
                     silver_gsr_closes = [float(p) / TROY_OUNCE_TO_GRAMS for p in silver_hist['Close']]
 
@@ -3038,7 +3053,8 @@ class MetalCalculatorApp:
             # We need at least 90 days of lookback for the algorithm, and 7 days forward for the result
             total_days = len(primary_closes_all)
             min_lookback = 90  # need ~90 days for 60d correlation + 28d ratio + buffer
-            backtest_start = max(min_lookback, total_days - 365)
+            backtest_days = int(backtest_months * 30.44)  # approximate trading days in selected months
+            backtest_start = max(min_lookback, total_days - backtest_days)
             backtest_end = total_days - 7  # need 7 days forward for actual price
 
             if backtest_start >= backtest_end:
